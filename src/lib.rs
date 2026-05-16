@@ -1,0 +1,275 @@
+//! # regex-pii-rs
+//!
+//! Detect and redact common PII (emails, NA-format phones, US SSNs,
+//! credit-card-shaped numbers, prefixed API keys) without pulling in
+//! the `regex` crate. Hand-rolled scanners, zero deps.
+//!
+//! ## Example
+//!
+//! ```
+//! use regex_pii_rs::{find, redact};
+//! let s = "Contact jane.doe@example.com or 555-123-4567.";
+//! let hits = find(s);
+//! assert!(hits.iter().any(|f| f.kind == "email"));
+//! assert!(!redact(s).contains("jane.doe"));
+//! ```
+
+#![deny(missing_docs)]
+
+/// One detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    /// Category: `email`, `phone`, `ssn`, `credit_card`, `api_key`.
+    pub kind: &'static str,
+    /// Matched text.
+    pub value: String,
+    /// Byte offset in the input.
+    pub byte_pos: usize,
+}
+
+/// Return every detection in `s`, sorted by position.
+pub fn find(s: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    out.extend(scan_emails(s));
+    out.extend(scan_phones(s));
+    out.extend(scan_ssns(s));
+    out.extend(scan_cards(s));
+    out.extend(scan_api_keys(s));
+    out.sort_by_key(|f| f.byte_pos);
+    out
+}
+
+/// Replace every finding with `[REDACTED:<kind>]`.
+pub fn redact(s: &str) -> String {
+    let findings = find(s);
+    if findings.is_empty() {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0;
+    for f in &findings {
+        if f.byte_pos < cursor {
+            continue; // overlap (e.g. credit_card sub-matches phone)
+        }
+        out.push_str(&s[cursor..f.byte_pos]);
+        out.push_str(&format!("[REDACTED:{}]", f.kind));
+        cursor = f.byte_pos + f.value.len();
+    }
+    out.push_str(&s[cursor..]);
+    out
+}
+
+// --- per-kind scanners ---------------------------------------------------
+
+fn scan_emails(s: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'@' {
+            // walk left for local-part
+            let mut start = i;
+            while start > 0 && is_email_local(bytes[start - 1]) {
+                start -= 1;
+            }
+            // walk right for domain
+            let mut end = i + 1;
+            while end < bytes.len() && is_email_domain(bytes[end]) {
+                end += 1;
+            }
+            if start < i && end > i + 1 && s[i + 1..end].contains('.') {
+                out.push(Finding {
+                    kind: "email",
+                    value: s[start..end].to_string(),
+                    byte_pos: start,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn is_email_local(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'%' | b'+' | b'-')
+}
+fn is_email_domain(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-')
+}
+
+fn scan_phones(s: &str) -> Vec<Finding> {
+    // Matches `(NNN) NNN-NNNN`, `NNN-NNN-NNNN`, `NNN.NNN.NNNN`,
+    // `+1 NNN-NNN-NNNN`. Implemented as a small state machine over
+    // digit-or-separator tokens.
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        let digit_chunk = |i: usize| {
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            j - i
+        };
+        // Optional +1
+        if bytes[i] == b'+' && i + 1 < bytes.len() && bytes[i + 1] == b'1' {
+            i += 2;
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'-' || bytes[i] == b'.') {
+                i += 1;
+            }
+        }
+        // Optional `(NNN) `
+        if i < bytes.len() && bytes[i] == b'(' && i + 4 < bytes.len() && bytes[i + 4] == b')' {
+            let in_paren = &bytes[i + 1..i + 4];
+            if in_paren.iter().all(|b| b.is_ascii_digit()) {
+                i += 5;
+                while i < bytes.len() && (bytes[i] == b' ') {
+                    i += 1;
+                }
+                let mid = digit_chunk(i);
+                if mid == 3
+                    && i + 3 < bytes.len()
+                    && matches!(bytes[i + 3], b'-' | b'.' | b' ')
+                {
+                    let last_start = i + 4;
+                    if digit_chunk(last_start) == 4 {
+                        out.push(Finding {
+                            kind: "phone",
+                            value: s[start..last_start + 4].to_string(),
+                            byte_pos: start,
+                        });
+                        i = last_start + 4;
+                        continue;
+                    }
+                }
+            }
+        }
+        // `NNN-NNN-NNNN` or `NNN.NNN.NNNN`
+        if digit_chunk(i) == 3
+            && i + 3 < bytes.len()
+            && matches!(bytes[i + 3], b'-' | b'.')
+        {
+            let sep = bytes[i + 3];
+            let mid_start = i + 4;
+            if digit_chunk(mid_start) == 3
+                && mid_start + 3 < bytes.len()
+                && bytes[mid_start + 3] == sep
+            {
+                let last_start = mid_start + 4;
+                if digit_chunk(last_start) == 4 {
+                    out.push(Finding {
+                        kind: "phone",
+                        value: s[start..last_start + 4].to_string(),
+                        byte_pos: start,
+                    });
+                    i = last_start + 4;
+                    continue;
+                }
+            }
+        }
+        i = start + 1;
+    }
+    out
+}
+
+fn scan_ssns(s: &str) -> Vec<Finding> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 11 <= bytes.len() {
+        let slice = &bytes[i..i + 11];
+        if slice.iter().enumerate().all(|(k, c)| match k {
+            3 | 6 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        }) {
+            // Boundary check: avoid taking part of a longer digit run.
+            let left_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
+            let right_ok = i + 11 == bytes.len() || !bytes[i + 11].is_ascii_digit();
+            if left_ok && right_ok {
+                out.push(Finding {
+                    kind: "ssn",
+                    value: s[i..i + 11].to_string(),
+                    byte_pos: i,
+                });
+                i += 11;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn scan_cards(s: &str) -> Vec<Finding> {
+    // 13–19 digits, optionally separated by spaces or dashes. We don't
+    // Luhn-check (false positives on phone-like sequences would be
+    // worse than missing a few rejects).
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        let mut digits = 0;
+        let mut seps = 0;
+        while i < bytes.len() {
+            if bytes[i].is_ascii_digit() {
+                digits += 1;
+                i += 1;
+            } else if matches!(bytes[i], b' ' | b'-') && digits > 0 {
+                seps += 1;
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let span_len = i - start;
+        if (13..=19).contains(&digits) && (4..=span_len).contains(&span_len) {
+            let value = &s[start..i];
+            // Trim trailing separator if any.
+            let trimmed = value.trim_end_matches(|c: char| c == ' ' || c == '-');
+            // Avoid taking what we'd also match as a phone (10 digits + seps).
+            if digits >= 13 {
+                out.push(Finding {
+                    kind: "credit_card",
+                    value: trimmed.to_string(),
+                    byte_pos: start,
+                });
+                continue;
+            }
+        }
+        if i == start {
+            i += 1;
+        }
+        let _ = seps;
+    }
+    out
+}
+
+fn scan_api_keys(s: &str) -> Vec<Finding> {
+    let prefixes: &[&str] = &["sk-", "sk_live_", "sk_test_", "ghp_", "xoxb-", "rk_live_"];
+    let mut out = Vec::new();
+    for p in prefixes {
+        let mut start = 0;
+        while let Some(pos) = s[start..].find(p) {
+            let abs = start + pos;
+            // Greedy match across [A-Za-z0-9_-].
+            let bytes = s.as_bytes();
+            let mut end = abs + p.len();
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b'-'))
+            {
+                end += 1;
+            }
+            let tail = end - (abs + p.len());
+            if tail >= 16 {
+                out.push(Finding {
+                    kind: "api_key",
+                    value: s[abs..end].to_string(),
+                    byte_pos: abs,
+                });
+            }
+            start = end.max(abs + 1);
+        }
+    }
+    out
+}

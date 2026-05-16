@@ -1,0 +1,15 @@
+[package]
+name = "regex-pii-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Regex-only PII detector for emails, phones, SSNs, credit cards, and prefixed API keys. Rust port of pii-sentry. Zero deps."
+authors = ["Mukunda Rao Katta <mukunda.vjcs6@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MukundaKatta/regex-pii-rs"
+homepage = "https://github.com/MukundaKatta/regex-pii-rs"
+documentation = "https://docs.rs/regex-pii-rs"
+readme = "README.md"
+keywords = ["pii", "redaction", "security", "privacy", "regex-free"]
+categories = ["text-processing"]
+exclude = [".github/*", "target/*"]
