@@ -28,14 +28,36 @@ pub struct Finding {
 }
 
 /// Return every detection in `s`, sorted by position.
+///
+/// Overlapping detections are resolved in favor of the one that starts
+/// earliest, and—on ties—the longer one. This prevents a digit run
+/// embedded in a wider match (e.g. the trailing digits of an API key, or
+/// a phone-shaped sequence inside a credit-card span) from being reported
+/// as a second, spurious finding.
 pub fn find(s: &str) -> Vec<Finding> {
-    let mut out = Vec::new();
-    out.extend(scan_emails(s));
-    out.extend(scan_phones(s));
-    out.extend(scan_ssns(s));
-    out.extend(scan_cards(s));
-    out.extend(scan_api_keys(s));
-    out.sort_by_key(|f| f.byte_pos);
+    let mut all = Vec::new();
+    all.extend(scan_emails(s));
+    all.extend(scan_phones(s));
+    all.extend(scan_ssns(s));
+    all.extend(scan_cards(s));
+    all.extend(scan_api_keys(s));
+    // Sort by start position, then by descending length so the widest
+    // match at a given offset is considered first.
+    all.sort_by(|a, b| {
+        a.byte_pos
+            .cmp(&b.byte_pos)
+            .then_with(|| b.value.len().cmp(&a.value.len()))
+    });
+
+    let mut out: Vec<Finding> = Vec::with_capacity(all.len());
+    let mut cursor = 0;
+    for f in all {
+        if f.byte_pos < cursor {
+            continue; // contained in / overlapping a kept finding
+        }
+        cursor = f.byte_pos + f.value.len();
+        out.push(f);
+    }
     out
 }
 
@@ -48,8 +70,10 @@ pub fn redact(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut cursor = 0;
     for f in &findings {
+        // `find` already removes overlaps, but guard defensively so a
+        // stray overlapping finding can never panic the slice below.
         if f.byte_pos < cursor {
-            continue; // overlap (e.g. credit_card sub-matches phone)
+            continue;
         }
         out.push_str(&s[cursor..f.byte_pos]);
         out.push_str(&format!("[REDACTED:{}]", f.kind));
@@ -127,10 +151,7 @@ fn scan_phones(s: &str) -> Vec<Finding> {
                     i += 1;
                 }
                 let mid = digit_chunk(i);
-                if mid == 3
-                    && i + 3 < bytes.len()
-                    && matches!(bytes[i + 3], b'-' | b'.' | b' ')
-                {
+                if mid == 3 && i + 3 < bytes.len() && matches!(bytes[i + 3], b'-' | b'.' | b' ') {
                     let last_start = i + 4;
                     if digit_chunk(last_start) == 4 {
                         out.push(Finding {
@@ -145,10 +166,7 @@ fn scan_phones(s: &str) -> Vec<Finding> {
             }
         }
         // `NNN-NNN-NNNN` or `NNN.NNN.NNNN`
-        if digit_chunk(i) == 3
-            && i + 3 < bytes.len()
-            && matches!(bytes[i + 3], b'-' | b'.')
-        {
+        if digit_chunk(i) == 3 && i + 3 < bytes.len() && matches!(bytes[i + 3], b'-' | b'.') {
             let sep = bytes[i + 3];
             let mid_start = i + 4;
             if digit_chunk(mid_start) == 3
@@ -222,20 +240,16 @@ fn scan_cards(s: &str) -> Vec<Finding> {
                 break;
             }
         }
-        let span_len = i - start;
-        if (13..=19).contains(&digits) && (4..=span_len).contains(&span_len) {
+        if (13..=19).contains(&digits) {
             let value = &s[start..i];
             // Trim trailing separator if any.
-            let trimmed = value.trim_end_matches(|c: char| c == ' ' || c == '-');
-            // Avoid taking what we'd also match as a phone (10 digits + seps).
-            if digits >= 13 {
-                out.push(Finding {
-                    kind: "credit_card",
-                    value: trimmed.to_string(),
-                    byte_pos: start,
-                });
-                continue;
-            }
+            let trimmed = value.trim_end_matches([' ', '-']);
+            out.push(Finding {
+                kind: "credit_card",
+                value: trimmed.to_string(),
+                byte_pos: start,
+            });
+            continue;
         }
         if i == start {
             i += 1;
