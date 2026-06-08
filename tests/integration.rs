@@ -108,3 +108,54 @@ fn multiple_findings_sorted_by_position() {
     assert_eq!(hits[1].kind, "ssn");
     assert!(hits[0].byte_pos < hits[1].byte_pos);
 }
+
+#[test]
+fn card_followed_by_phone_both_detected() {
+    // Regression: a complete card must not greedily absorb the digits of a
+    // trailing phone (which previously made the card vanish entirely,
+    // leaking the card number in `redact`).
+    let s = "4111 1111 1111 1111 555-123-4567";
+    let hits = find(s);
+    assert!(hits
+        .iter()
+        .any(|f| f.kind == "credit_card" && f.value == "4111 1111 1111 1111"));
+    assert!(hits.iter().any(|f| f.kind == "phone"));
+    assert_eq!(redact(s), "[REDACTED:credit_card] [REDACTED:phone]");
+}
+
+#[test]
+fn two_adjacent_cards_both_detected() {
+    // Regression: two space-separated cards used to be merged into a single
+    // 32-digit run, fail the 13..=19 length check, and be dropped entirely.
+    let s = "4111 1111 1111 1111 4222 2222 2222 2222";
+    let hits: Vec<_> = find(s)
+        .into_iter()
+        .filter(|f| f.kind == "credit_card")
+        .collect();
+    assert_eq!(hits.len(), 2, "expected two cards, got {hits:?}");
+    assert_eq!(hits[0].value, "4111 1111 1111 1111");
+    assert_eq!(hits[1].value, "4222 2222 2222 2222");
+}
+
+#[test]
+fn card_not_swallowed_by_trailing_number() {
+    // A standalone number after a complete card (e.g. an expiry year) must
+    // not be pulled into the card span.
+    let s = "4111 1111 1111 1111 2024";
+    let hits: Vec<_> = find(s)
+        .into_iter()
+        .filter(|f| f.kind == "credit_card")
+        .collect();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].value, "4111 1111 1111 1111");
+    assert_eq!(redact(s), "[REDACTED:credit_card] 2024");
+}
+
+#[test]
+fn amex_grouping_detected() {
+    let s = "pay 3782 822463 10005 now";
+    let hits = find(s);
+    assert!(hits
+        .iter()
+        .any(|f| f.kind == "credit_card" && f.value == "3782 822463 10005"));
+}

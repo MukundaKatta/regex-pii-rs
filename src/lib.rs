@@ -219,42 +219,77 @@ fn scan_ssns(s: &str) -> Vec<Finding> {
 }
 
 fn scan_cards(s: &str) -> Vec<Finding> {
-    // 13–19 digits, optionally separated by spaces or dashes. We don't
-    // Luhn-check (false positives on phone-like sequences would be
-    // worse than missing a few rejects).
+    // 13–19 digits, written as digit groups joined by single spaces or
+    // dashes (e.g. `4111 1111 1111 1111`, `4111-1111-1111-1111`) or as a
+    // single unbroken run. We don't Luhn-check (false positives on
+    // phone-like sequences would be worse than missing a few rejects).
+    //
+    // Cards are matched by accumulating *whole* digit groups: a card never
+    // splits a group, and never swallows a separator that bridges into an
+    // unrelated trailing number. This keeps a valid card from being lost
+    // inside a longer digit/separator run and stops the match from
+    // grabbing digits that belong to the following token.
     let bytes = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
         let start = i;
-        let mut digits = 0;
-        let mut seps = 0;
-        while i < bytes.len() {
-            if bytes[i].is_ascii_digit() {
-                digits += 1;
-                i += 1;
-            } else if matches!(bytes[i], b' ' | b'-') && digits > 0 {
-                seps += 1;
-                i += 1;
+        let mut digits = 0usize;
+        // Byte position just past the last digit included in the card so
+        // far (always ends on a digit, never a separator).
+        let mut card_end = start;
+        let mut j = i;
+        loop {
+            // Consume one digit group.
+            let group_start = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let group_len = j - group_start;
+            // Would adding this whole group exceed a card's max length?
+            if digits + group_len > 19 {
+                break;
+            }
+            // Once we already hold a complete card (>=13 digits), refuse to
+            // absorb a further *short* group (<4 digits). Real card groups
+            // are always >=4 digits (Visa/MC 4-4-4-4, Amex 4-6-5), so a
+            // trailing 1-3 digit group joined by a space/dash is almost
+            // certainly the start of a separate token (a phone area code,
+            // an SSN, a year, ...), not part of the card.
+            if digits >= 13 && group_len < 4 {
+                break;
+            }
+            digits += group_len;
+            card_end = j;
+            // Allow a single separator only if it is followed by another
+            // digit group (otherwise it is trailing punctuation).
+            if j < bytes.len()
+                && matches!(bytes[j], b' ' | b'-')
+                && j + 1 < bytes.len()
+                && bytes[j + 1].is_ascii_digit()
+            {
+                j += 1;
             } else {
                 break;
             }
         }
+
         if (13..=19).contains(&digits) {
-            let value = &s[start..i];
-            // Trim trailing separator if any.
-            let trimmed = value.trim_end_matches([' ', '-']);
             out.push(Finding {
                 kind: "credit_card",
-                value: trimmed.to_string(),
+                value: s[start..card_end].to_string(),
                 byte_pos: start,
             });
-            continue;
+            i = card_end;
+        } else {
+            // No valid card starting here; skip past the run we examined
+            // so we never re-scan the same digits.
+            i = j.max(start + 1);
         }
-        if i == start {
-            i += 1;
-        }
-        let _ = seps;
     }
     out
 }
